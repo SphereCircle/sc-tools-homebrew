@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 #############################################
 # CONFIGURATION
@@ -40,6 +40,14 @@ ERROR_LOG="$LOG_DIR/errors.log"
 
 API="https://api.github.com"
 
+on_err() {
+    local exit_code=$?
+    echo -e "${RED:-}[$(date +%F_%T)] ERROR:${RESET:-} Command failed (exit=${exit_code}) at line ${BASH_LINENO[0]}: ${BASH_COMMAND}" | tee -a "$ERROR_LOG" >&2
+    exit "$exit_code"
+}
+
+trap on_err ERR
+
 #############################################
 # COLORS
 #############################################
@@ -72,16 +80,22 @@ log() {
 }
 
 err() {
-    echo -e "${RED}[$(date +%F_%T)] ERROR:${RESET} $1" | tee -a "$ERROR_LOG"
-    ((FAILED++))
+    echo -e "${RED}[$(date +%F_%T)] ERROR:${RESET} $1" | tee -a "$ERROR_LOG" >&2
+    ((++FAILED))
 }
 
 vlog() {
-    [[ "$VERBOSE" == true ]] && echo -e "${YELLOW}[VERBOSE]${RESET} $1"
+    if [[ "$VERBOSE" == true ]]; then
+        echo -e "${YELLOW}[VERBOSE]${RESET} $1" >&2
+    fi
+    return 0
 }
 
 dlog() {
-    [[ "$DEBUG" == true ]] && echo -e "${BLUE}[DEBUG]${RESET} $1"
+    if [[ "$DEBUG" == true ]]; then
+        echo -e "${BLUE}[DEBUG]${RESET} $1" >&2
+    fi
+    return 0
 }
 
 #############################################
@@ -268,11 +282,24 @@ fetch_all_pages() {
         response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
             "$url?page=$page&per_page=100")
 
-        # If GitHub returns a string instead of JSON → token issue
-        if ! echo "$response" | jq . >/dev/null 2>&1; then
-            err "GitHub returned non‑JSON response for $url"
+        # Ensure response is valid JSON
+        if ! echo "$response" | jq -e . >/dev/null 2>&1; then
+            err "Invalid JSON from GitHub API at $url (page=$page)"
+            echo "--- Invalid JSON response ($url, page=$page) ---" >> "$ERROR_LOG"
             echo "$response" >> "$ERROR_LOG"
-            break
+            return 1
+        fi
+
+        # GitHub list endpoints should return arrays
+        local json_type
+        json_type=$(echo "$response" | jq -r 'type')
+        if [[ "$json_type" != "array" ]]; then
+            local api_message
+            api_message=$(echo "$response" | jq -r '.message // "No message"')
+            err "Unexpected JSON type '$json_type' from $url (page=$page): $api_message"
+            echo "--- Unexpected JSON type response ($url, page=$page) ---" >> "$ERROR_LOG"
+            echo "$response" >> "$ERROR_LOG"
+            return 1
         fi
 
         local count
@@ -324,6 +351,7 @@ progress_bar() {
     local current=$1
     local total=$2
     local width=40
+    local i
 
     (( total == 0 )) && total=1
 
@@ -332,8 +360,8 @@ progress_bar() {
     local empty=$((width - filled))
 
     printf "\r["
-    printf "%0.s#" $(seq 1 $filled)
-    printf "%0.s-" $(seq 1 $empty)
+    for ((i = 0; i < filled; i++)); do printf "#"; done
+    for ((i = 0; i < empty; i++)); do printf "-"; done
     printf "] %3d%% (%d/%d)" "$percent" "$current" "$total"
 }
 
@@ -427,7 +455,7 @@ clone_repo() {
         return
     fi
 
-    ((CLONED++))
+    ((++CLONED))
     REPO_ACTIONS["$org/$repo"]="cloned"
 }
 
@@ -454,7 +482,7 @@ update_repo() {
         return
     fi
 
-    ((UPDATED++))
+    ((++UPDATED))
     REPO_ACTIONS["$org/$repo"]="updated"
 }
 
@@ -481,7 +509,7 @@ fetch_repo() {
         return
     fi
 
-    ((FETCHED++))
+    ((++FETCHED))
     REPO_ACTIONS["$org/$repo"]="fetched"
 }
 
@@ -529,14 +557,27 @@ for org in "${ORGS[@]}"; do
     dlog "Fetching repos for org: $org"
 
     # Org repos
-    org_repos=$(fetch_all_pages "$API/orgs/$org/repos" || echo "[]")
+    if ! org_repos=$(fetch_all_pages "$API/orgs/$org/repos"); then
+        err "Failed to fetch org repos for '$org' from $API/orgs/$org/repos"
+        org_repos="[]"
+    fi
 
     # User repos (if org == username)
-    user_repos=$(fetch_all_pages "$API/users/$org/repos" || echo "[]")
+    if ! user_repos=$(fetch_all_pages "$API/users/$org/repos"); then
+        err "Failed to fetch user repos for '$org' from $API/users/$org/repos"
+        user_repos="[]"
+    fi
 
     # Merge
-    merged=$(jq -s 'add' <(echo "$org_repos") <(echo "$user_repos"))
-    repos_json=$(jq -s 'add' <(echo "$repos_json") <(echo "$merged"))
+    if ! merged=$(jq -s 'add' <(echo "$org_repos") <(echo "$user_repos")); then
+        err "jq merge failed for org '$org' while combining org/user repo lists"
+        continue
+    fi
+
+    if ! repos_json=$(jq -s 'add' <(echo "$repos_json") <(echo "$merged")); then
+        err "jq merge failed while appending repos for org '$org' to global list"
+        continue
+    fi
 done
 
 #############################################
@@ -549,8 +590,8 @@ echo
 #############################################
 # PROCESS EACH REPO
 #############################################
-echo "$repos_json" | jq -c '.[]' | while read -r repo_json; do
-    ((PROCESSED_REPOS++))
+while read -r repo_json; do
+    ((++PROCESSED_REPOS))
     progress_bar "$PROCESSED_REPOS" "$TOTAL_REPOS"
 
     # Apply filters
@@ -568,7 +609,7 @@ echo "$repos_json" | jq -c '.[]' | while read -r repo_json; do
     # REPO EXISTS LOCALLY
     #############################################
     if [[ -d "$dest/.git" ]]; then
-        ((SKIPPED++))
+        ((++SKIPPED))
 
         if [[ "$UPDATE_MODE" == true ]]; then
             wait_for_slot
@@ -588,7 +629,7 @@ echo "$repos_json" | jq -c '.[]' | while read -r repo_json; do
     #############################################
     wait_for_slot
     clone_repo "$org_name" "$repo_name" "$clone_url" "$dest" &
-done
+done < <(echo "$repos_json" | jq -c '.[]')
 
 wait
 echo
